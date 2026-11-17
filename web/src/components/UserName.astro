@@ -1,0 +1,27 @@
+---
+/**
+ * 人の名前。装備中の称号があれば、レアリティの色とアイコンを付ける。
+ * ダッシュボードで名前を出すところは必ずこれを使う（test/name-style-usage.test.ts で確認している）。
+ */
+import { ICON_EMOJI_CLASS, ICON_IMG_CLASS, iconView, nameStyleOf, type NameStyleRow } from '../lib/name-style.ts';
+
+interface Props {
+  name: string;
+  /** NAME_STYLE_COLUMNS で取った行（name_color / name_icon / name_title） */
+  style: NameStyleRow | null | undefined;
+  href?: string;
+  class?: string;
+}
+
+const { name, style, href, class: cls } = Astro.props;
+const s = nameStyleOf(style);
+const icon = iconView(s.icon);
+const Tag = href ? 'a' : 'span';
+---
+<Tag
+  href={href}
+  class={cls}
+  style={s.color ? `color:${s.color}` : undefined}
+  title={s.title ?? undefined}
+  data-user-name
+>{name}{icon?.kind === 'img' && <img src={icon.src} alt="" aria-hidden="true" class={ICON_IMG_CLASS} loading="lazy" />}{icon?.kind === 'emoji' && <span aria-hidden="true" class={ICON_EMOJI_CLASS}>{icon.text}</span>}</Tag>

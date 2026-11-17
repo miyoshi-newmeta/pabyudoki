@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.astro/
+web/.local/
+.env
+.env.*
+.dev.vars
+.wrangler/
+.DS_Store

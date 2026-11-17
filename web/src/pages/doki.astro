@@ -1,0 +1,1248 @@
+---
+import Layout from '../layouts/Layout.astro';
+import { pokerOrigin } from '../lib/poker.ts';
+import UserName from '../components/UserName.astro';
+import { NAME_STYLE_COLUMNS, nameStyleJoin, type NameStyleRow } from '../lib/name-style.ts';
+import { userPath } from '../lib/houses.ts';
+import { AT_GAMES, BET, CBELL_N, COIN_PT, DAILY_GAME_LIMIT, GRAPH_EVERY, HIT, KOBOSHI_N, MACHINES, PAYOUT, REELS, ROLE_N, SPEC, TIMING, jstDay, jstWeekStart, oneIn } from '../lib/doki.ts';
+
+export const prerender = false;
+
+const env = (Astro.locals as { runtime?: { env?: Record<string, unknown> } }).runtime?.env;
+const db = env?.DB as D1Database | undefined;
+const origin = pokerOrigin(env);
+
+const now = Date.now();
+const week = jstWeekStart(now);
+const today = jstDay(now);
+
+// 台ごとのみんなの今日・今週（設定を推し量る材料。どれがどの設定かは週が終わるまで出さない）
+interface MTot { machine: number; games: number; big: number; reg: number; cbell: number; players: number }
+const MACHINE_NOS = [...MACHINES] as number[];
+const emptyM = (): MTot[] => MACHINE_NOS.map((machine) => ({ machine, games: 0, big: 0, reg: 0, cbell: 0, players: 0 }));
+let mToday = emptyM();
+let mWeek = emptyM();
+let pastWeeks: { week: string; settings: string }[] = [];
+if (db) {
+  try {
+    // poker/src/doki.ts の MACHINE_TOTAL_SQL と同じ
+    const q = (from: string) => db
+      .prepare(`SELECT machine, SUM(games) AS games, SUM(big) AS big, SUM(reg) AS reg, SUM(cbell) AS cbell,
+          COUNT(DISTINCT CASE WHEN games > 0 THEN discord_id END) AS players
+        FROM doki_machine_daily WHERE day >= ? GROUP BY machine`)
+      .bind(from).all<MTot>();
+    const fill = (rows: MTot[] | undefined) => emptyM().map((e) => rows?.find((x) => x.machine === e.machine) ?? e);
+    const [t, w, p] = await Promise.all([
+      q(today), q(week),
+      db.prepare('SELECT week, settings FROM doki_week WHERE week < ? ORDER BY week DESC LIMIT 8').bind(week).all<{ week: string; settings: string }>(),
+    ]);
+    mToday = fill(t.results);
+    mWeek = fill(w.results);
+    pastWeeks = p.results ?? [];
+  } catch { /* 表がまだ無いときは 0 のまま出す */ }
+}
+interface Player extends NameStyleRow {
+  discord_id: string; display_name: string; avatar_url: string | null;
+  games: number; big: number; reg: number; pt: number; machines: string | null;
+}
+type PeriodKey = 'today' | 'week' | 'all';
+const players: Record<PeriodKey, Player[]> = { today: [], week: [], all: [] };
+if (db) {
+  try {
+    const q = (from: string) => db.prepare(
+      `SELECT u.discord_id, u.display_name, u.avatar_url, ${NAME_STYLE_COLUMNS},
+              SUM(d.games) AS games, SUM(d.big) AS big, SUM(d.reg) AS reg, SUM(d.coin_out - d.coin_in) AS pt,
+              (SELECT GROUP_CONCAT(machine) FROM (SELECT DISTINCT machine FROM doki_machine_daily m
+                 WHERE m.discord_id = d.discord_id AND m.day >= ? ORDER BY machine)) AS machines
+       FROM doki_daily d
+       JOIN users u ON u.discord_id = d.discord_id
+       ${nameStyleJoin('u.discord_id')}
+       WHERE d.day >= ?
+       GROUP BY d.discord_id
+       HAVING SUM(d.games) > 0
+       ORDER BY pt DESC, games DESC
+       LIMIT 50`,
+    ).bind(from, from).all<Player>();
+    const [t, w, a] = await Promise.all([q(today), q(week), q('0000-00-00')]);
+    players.today = t.results ?? [];
+    players.week = w.results ?? [];
+    players.all = a.results ?? [];
+  } catch { /* 表がまだ無いときは空で出す */ }
+}
+const PERIODS: [PeriodKey, string][] = [['today', '今日'], ['week', '今週'], ['all', 'これまで']];
+const signed = (n: number) => (n > 0 ? '+' : '') + Math.round(n).toLocaleString('en-US');
+const rate = (games: number, n: number, digits = 1) => (n > 0 ? `1/${(games / n).toFixed(digits)}` : '—');
+const md = (d: string) => `${Number(d.slice(5, 7))}/${Number(d.slice(8, 10))}`;
+const weekEnd = new Date(Date.parse(week + 'T00:00:00Z') + 6 * 86400_000).toISOString().slice(0, 10);
+/** 終わった週の設定を、高い設定から「設定6 台3」の形で（設定4 まで） */
+const highOf = (settings: string): [number, number[]][] => {
+  const list = settings.split(',').map(Number);
+  return [6, 5, 4].map((st): [number, number[]] => [st, list.flatMap((x, i) => (x === st ? [i + 1] : []))]).filter(([, ms]) => ms.length > 0);
+};
+
+const roles = [
+  { sym: ['7', '7', '7'], name: 'BIG（AT 70G）', pay: '約210枚', pts: 210 * COIN_PT, odds: '設定別' },
+  { sym: ['7', '7', 'B'], name: 'REG（AT 30G）', pay: '約90枚', pts: 90 * COIN_PT, odds: '設定別' },
+  { sym: ['L', 'L', 'L'], name: '押し順ベル（ボーナス中のナビどおり・中段以外）', pay: `${PAYOUT.bell}枚`, pts: PAYOUT.bell * COIN_PT, odds: oneIn(ROLE_N.bells - CBELL_N[1]) },
+  { sym: [] as string[], name: '押し順ベルの取りこぼし（通常時はいつも）', pay: `${PAYOUT.bell_miss}枚（1枚のことも）`, pts: 0, odds: '—' },
+  { sym: ['L', 'L', 'L'], name: '共通ベル（中段）', pay: `${PAYOUT.cbell}枚`, pts: PAYOUT.cbell * COIN_PT, odds: '設定別' },
+  { sym: ['S', 'S', 'S'], name: 'スイカ', pay: `${PAYOUT.suika}枚`, pts: PAYOUT.suika * COIN_PT, odds: oneIn(ROLE_N.suika) },
+  { sym: ['C', '', ''], name: '角チェリー', pay: `${PAYOUT.cherry}枚`, pts: PAYOUT.cherry * COIN_PT, odds: oneIn(ROLE_N.cherry) },
+  { sym: ['S', 'S', ''], name: '確定役（スイカのテンパイはずれ・BIG 確定）', pay: `${PAYOUT.kakutei}枚`, pts: PAYOUT.kakutei * COIN_PT, odds: oneIn(ROLE_N.kakutei) },
+  { sym: ['C', '7', ''], name: '確定チェリー（中リール中段に 7・BIG 確定）', pay: `${PAYOUT.kcherry}枚`, pts: PAYOUT.kcherry * COIN_PT, odds: oneIn(ROLE_N.kcherry) },
+  { sym: ['C', '', ''], name: '中段チェリー（BIG＋天国以上 確定）', pay: `${PAYOUT.mcherry}枚`, pts: PAYOUT.mcherry * COIN_PT, odds: oneIn(ROLE_N.mcherry) },
+  { sym: ['R', 'R', 'R'], name: 'リプレイ', pay: '再遊技', pts: 0, odds: oneIn(ROLE_N.replay) },
+];
+/** 役の恩恵（通常時）：モードごとのボーナス当選率。設定1〜6 の幅で出す */
+const pct = (a: readonly number[]) => (a[0] === a[5] ? `${a[0]}%` : `${a[0]}〜${a[5]}%`);
+const BENEFITS: [string, keyof typeof HIT][] = [['通常A・B', 'N'], ['引き戻し', 'HK'], ['チャンス', 'CH'], ['保障・天国・ドキドキ・超ドキドキ', 'UP']];
+const SYM_NAME: Record<string, string> = { '7': '7', B: 'BAR', L: 'ベル', R: 'リプレイ', C: 'チェリー', S: 'スイカ' };
+const LAMPS: [string, string, string][] = [
+  ['通常点滅', 'ボーナス確定', ''],
+  ['高速点滅・スロー点滅', '通常B 以上のチャンス', ''],
+  ['花と葉の交互点滅', '通常B 以上の期待', ''],
+  ['337拍子', '天国の期待大', 't'],
+  ['右のみ点滅・パネル消灯', '天国以上の期待大', 't'],
+  ['左のみ点滅・リバースストリーム', 'ドキドキ以上確定', 'd'],
+  ['ドキドキランプ点灯・しだれ柳', '超ドキドキ確定', 's'],
+];
+---
+<Layout title="ぱびゅドキ！ | ぱぶびゅ！ダッシュボード">
+  <svg width="0" height="0" class="absolute" aria-hidden="true">
+    {['7', 'B', 'L', 'C', 'S'].map((s) => (
+      <symbol id={`dk-${s}`} viewBox="0 0 100 80" overflow="visible">
+        <image href={`/doki/sym/${s}.webp`} x={s === 'B' ? -6 : 8} y={s === '7' ? 0 : 4} width={s === 'B' ? 112 : 84} height={s === '7' ? 80 : 72} preserveAspectRatio="xMidYMid meet" />
+      </symbol>
+    ))}
+    <symbol id="dk-R" viewBox="0 0 100 80"><image href="/slot/sym/R.webp" x="8" y="5.3" width="84" height="69.4" preserveAspectRatio="xMidYMid meet" /></symbol>
+  </svg>
+
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Mochiy+Pop+One&family=Righteous&display=swap" />
+  <main class="mx-auto max-w-5xl px-4 py-10 sm:px-6 sm:py-14" id="doki-root" data-origin={origin}>
+    <nav class="mb-6 flex flex-wrap items-center justify-between gap-2 text-sm">
+      <a href="/" class="text-slate-400 hover:text-slate-200">← トップへ</a>
+      <span class="dk-hall" role="group" aria-label="機種">
+        <a href="/slot">🎰 ぱびゅらー</a><a href="/doki" aria-current="page">🌺 ぱびゅドキ！</a>
+      </span>
+    </nav>
+
+    <header class="max-w-2xl">
+      <h1 class="text-3xl font-black tracking-tight sm:text-4xl" style="text-wrap: balance">🌺 ぱびゅドキ！</h1>
+      <p class="mt-2 text-sm leading-relaxed text-slate-400" style="text-wrap: pretty">
+        沖ドキ風のスロットです。上の <b class="text-pink-300">ハイビスカス</b> が光ればボーナス。光り方で「次も 32G 以内に当たりそうか」が分かります。
+        ボーナスは押し順ナビの AT（BIG 70G・REG 30G）。1枚 = {COIN_PT}pt、3枚掛け（{BET * COIN_PT}pt）。使えるポイントで遊べます。
+      </p>
+    </header>
+
+    <section class="mt-8 grid gap-8 lg:grid-cols-[minmax(0,28rem)_minmax(0,1fr)] lg:items-start">
+      <div class="mx-auto w-full max-w-[28rem]">
+        <div class="dk-machines" role="group" aria-label="台を選ぶ">
+          {MACHINE_NOS.map((m) => <button type="button" class="dk-machine" data-machine={m} aria-pressed={m === 1 ? 'true' : 'false'}>台{m}</button>)}
+        </div>
+        <div class="dk-cab" id="cab">
+          <div class="dk-top">
+            <div class="dk-sign"><b>ぱびゅドキ！</b><i>PUBYU-DOKI!</i></div>
+            <div class="dk-hibi" id="hibi" aria-label="ハイビスカス" role="img">
+              {[0, 1, 2, 3, 4].map(() => <img src="/doki/sym/H.webp" alt="" />)}
+            </div>
+            <div class="dk-subl"><span class="dk-dlamp" id="dlamp">DOKI DOKI</span></div>
+          </div>
+          <div class="dk-mid">
+            <div class="dk-window">
+              <div class="dk-reels" id="reels">
+                {[0, 1, 2].map((r) => <div class="dk-reel" data-reel={r}><div class="dk-strip"></div></div>)}
+              </div>
+            </div>
+            <div class="dk-kana" id="kana" aria-label="しなのちゃんランプ（BIG 中に光ると 1G連）" role="img"><img src="/doki/kana.webp" alt="" /></div>
+          </div>
+          <div class="dk-meter" aria-label="ボーナス後の回転数（32G まで）"><div class="dk-meter-bar" id="meter"></div><span id="meterText">—</span></div>
+          <div class="dk-leds">
+            <div class="dk-led"><span>CREDIT</span><b id="credit">----</b></div>
+            <div class="dk-led"><span id="gameLabel">GAME</span><b id="gameCount">---</b></div>
+            <div class="dk-led"><span>PAY</span><b id="pay">0</b></div>
+          </div>
+          <div class="dk-controls">
+            <div class="grid gap-3">
+              <div class="flex items-center justify-between gap-2">
+                <button id="maxbet" type="button" class="dk-maxbet">MAX BET</button>
+                <span id="credit-pt" class="text-[11px] text-slate-400 tabular-nums"></span>
+              </div>
+              <div class="dk-stops">
+                {[0, 1, 2].map((r) => <button type="button" class="dk-stop" data-stop={r} disabled aria-label={`第${r + 1}リールを止める（${r + 1}キー）`}><span class="dk-nav"></span></button>)}
+              </div>
+            </div>
+            <div class="dk-lever-box">
+              <button id="lever" type="button" class="dk-lever" aria-label="レバー（スペース）"><span class="dk-lever-stick"></span><span class="dk-lever-knob"></span></button>
+            </div>
+          </div>
+          <div class="dk-opts">
+            <label><input id="auto" type="checkbox" /> 自動で止める（ナビどおり・当たりも揃えます）</label>
+            <button id="sound" type="button" aria-pressed="true">🔊 音あり</button>
+          </div>
+          <p id="msg" class="dk-msg" aria-live="polite"></p>
+          <p class="dk-keys">スペース：レバー・順に止める ／ 1 2 3 ／ Q W E：リールを止める ／ B：MAX BET</p>
+        </div>
+      </div>
+
+      <div class="grid min-w-0 gap-6">
+        <div class="dk-data">
+          <div class="dk-data-head"><span>データカウンター</span><span class="text-slate-500">今日（{md(today)}）</span></div>
+          <div class="dk-switches">
+            <div class="dk-vm" role="group" aria-label="見る台">
+              {MACHINE_NOS.map((m) => <button type="button" data-view-machine={m} aria-pressed={m === 1 ? 'true' : 'false'} aria-label={`台${m}`}>{m}</button>)}
+            </div>
+            <div class="dk-seg" role="group" aria-label="自分かみんなか">
+              <button type="button" data-scope="mine" aria-pressed="true">自分</button>
+              <button type="button" data-scope="all" aria-pressed="false">みんな</button>
+            </div>
+          </div>
+          <div class="dk-counts">
+            <div><span>BIG</span><b id="cBig" class="text-red-400">0</b></div>
+            <div><span>REG</span><b id="cReg" class="text-sky-300">0</b></div>
+            <div><span>総回転</span><b id="cGames">0</b></div>
+            <div><span>現在</span><b id="cSince">0</b></div>
+          </div>
+          <div class="dk-rates">
+            <div><span>ボーナス合算</span><b id="rSum">—</b></div>
+            <div><span>共通ベル</span><b id="rBell">—</b></div>
+            <div><span>差枚</span><b id="rDiff">0</b></div>
+          </div>
+          <div class="mt-4">
+            <div class="flex items-baseline justify-between text-xs text-slate-400"><span>スランプグラフ（枚）</span><span>{GRAPH_EVERY}回転ごと</span></div>
+            <div class="dk-graph-wrap"><svg id="graph" class="dk-graph" viewBox="0 0 400 200" role="img" aria-label="この台の今日の差枚の推移"></svg></div>
+          </div>
+          <div class="mt-4">
+            <div class="text-xs text-slate-400">ボーナス履歴（今日・<span id="histLabel">自分</span>）<span class="text-pink-300">　🌺 は 32G 以内の連チャン</span></div>
+            <ol id="history" class="dk-history"><li class="text-slate-500">まだありません</li></ol>
+          </div>
+          <div class="mt-4">
+            <div class="text-xs text-slate-400">自分のこれまで（7日・全台の合計）</div>
+            <div class="overflow-x-auto">
+              <table class="dk-table mt-1"><thead><tr><th>日</th><th>回転</th><th>BIG</th><th>REG</th><th>差枚</th></tr></thead><tbody id="days"><tr><td colspan="5" class="text-slate-500">—</td></tr></tbody></table>
+            </div>
+          </div>
+        </div>
+
+        <div class="dk-data">
+          <div class="dk-data-head"><span>みんなの台</span><span class="text-slate-500">{`設定6はどれ？（${md(week)}〜${md(weekEnd)}）`}</span></div>
+          {[['today', '今日', mToday], ['week', '今週', mWeek]].map(([span, label, rows]) => (
+            <div class="mt-2 overflow-x-auto">
+              <table class="dk-table">
+                <thead><tr><th>{label as string}</th><th>回転</th><th>BIG</th><th>REG</th><th>合算</th><th>共通ベル</th><th>人</th></tr></thead>
+                <tbody>
+                  {(rows as MTot[]).map((m) => (
+                    <tr data-mrow={`${span}-${m.machine}`}>
+                      <th>台{m.machine}</th>
+                      <td data-k="games">{m.games.toLocaleString('en-US')}</td><td data-k="big">{m.big}</td><td data-k="reg">{m.reg}</td>
+                      <td data-k="sum">{rate(m.games, m.big + m.reg)}</td><td data-k="cbell">{rate(m.games, m.cbell)}</td><td data-k="players">{m.players}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ))}
+          <p class="mt-2 text-xs leading-relaxed text-slate-500">12台に設定 6・5・4・4・3・3・3・2・2・1・1・1 が1台ずつ入っています。どの台がどの設定かは毎週月曜に決まり直し、週が終わったら下に出します。合算と共通ベル（中段に揃うベル）で推し量りましょう。</p>
+          {pastWeeks.length > 0 && (
+            <div class="mt-3 flex flex-wrap gap-2 text-xs">
+              {pastWeeks.map((w) => (
+                <span class="rounded-full bg-slate-800/70 px-2.5 py-1 text-slate-300 ring-1 ring-slate-700">{md(w.week)}〜 {highOf(w.settings).map(([st, ms], i) => <b class={st === 6 ? 'text-amber-300' : 'text-slate-300'}>{i > 0 ? '／' : ''}設定{st} {ms.map((m) => `台${m}`).join('・')}</b>)}</span>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </section>
+
+    <section class="mt-12" id="players">
+      <div class="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h2 class="text-lg font-bold">みんなの挑戦状況</h2>
+          <p class="mt-1 text-xs text-slate-400">だれが、どれだけ回して、何枚勝っているか。差枚の多い順（50人まで）</p>
+        </div>
+        <div class="dk-seg" role="group" aria-label="期間">
+          {PERIODS.map(([k, label]) => <button type="button" data-period={k} aria-pressed={k === 'today' ? 'true' : 'false'}>{label}</button>)}
+        </div>
+      </div>
+      {PERIODS.map(([k]) => (
+        <div class="mt-3 overflow-x-auto" data-period-panel={k} hidden={k !== 'today'}>
+          {players[k].length === 0 ? (
+            <p class="rounded-xl bg-slate-900/60 py-6 text-center text-sm text-slate-500 ring-1 ring-slate-800">まだだれも回していません</p>
+          ) : (
+            <table class="dk-table dk-players">
+              <thead><tr><th>#</th><th class="text-left">名前</th><th>台</th><th>回転</th><th>BIG</th><th>REG</th><th>合算</th><th>差枚</th></tr></thead>
+              <tbody>
+                {players[k].map((p, i) => (
+                  <tr>
+                    <td class="text-slate-500">{i + 1}</td>
+                    <td class="dk-player">
+                      <img src={p.avatar_url ?? '/favicon.svg'} alt="" loading="lazy" class="h-6 w-6 shrink-0 rounded-full bg-slate-800 object-cover" />
+                      <UserName name={p.display_name} style={p} href={userPath(p.display_name, p.discord_id)} class="truncate hover:underline" />
+                    </td>
+                    <td class="text-slate-400">{p.machines ? p.machines.split(',').map((m) => `台${m}`).join('・') : '—'}</td>
+                    <td>{p.games.toLocaleString('en-US')}</td><td>{p.big}</td><td>{p.reg}</td>
+                    <td>{rate(p.games, p.big + p.reg)}</td>
+                    <td class={p.pt > 0 ? 'text-red-300 font-bold' : p.pt < 0 ? 'text-sky-300' : ''}>{signed(p.pt)}枚</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      ))}
+    </section>
+
+    <section class="mt-12 grid gap-8 lg:grid-cols-2">
+      <div class="min-w-0">
+        <h2 class="text-lg font-bold">スペック表</h2>
+        <div class="mt-3 overflow-x-auto">
+          <table class="dk-table dk-spec">
+            <thead><tr><th>設定</th><th>BIG</th><th>REG</th><th>合算</th><th>共通ベル</th><th>機械割</th></tr></thead>
+            <tbody>
+              {[1, 2, 3, 4, 5, 6].map((s) => (
+                <tr><th>{s}</th><td>1/{SPEC[s].big}</td><td>1/{SPEC[s].reg}</td><td>1/{SPEC[s].sum}</td><td>{oneIn(CBELL_N[s])}</td><td class={SPEC[s].rate >= 100 ? 'text-amber-300' : ''}>{SPEC[s].rate.toFixed(1)}%</td></tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <h3 class="mt-5 text-sm font-bold">役の恩恵（ボーナス当選率・設定1〜6）</h3>
+        <div class="mt-2 overflow-x-auto">
+          <table class="dk-table dk-spec">
+            <thead><tr><th>モード</th><th>スイカ</th><th>チェリー</th><th>リプレイ・ベル</th></tr></thead>
+            <tbody>
+              {BENEFITS.map(([n, k]) => <tr><th>{n}</th><td>{pct(HIT[k].suika)}</td><td>{pct(HIT[k].cherry)}</td><td>{pct(HIT[k].other)}</td></tr>)}
+            </tbody>
+          </table>
+        </div>
+        <ul class="mt-2 grid gap-1 text-xs leading-relaxed text-slate-400">
+          <li>・確定役・確定チェリー・中段チェリーは、どのモードでも BIG 確定です。中段チェリーは次が天国以上（天国中ならドキドキ、ドキドキ以上なら超ドキドキ）</li>
+          <li>・チェリーで当たれば BIG、スイカは BIG と REG が半々、天井は BIG 60%。保障以上のリプレイ・ベルでの当たりは BIG 7：REG 3 です</li>
+          <li>・次のモードも当たった役で変わります。スイカは通常B・天国に上がりやすく、確定役・確定チェリーは天国以上に上がりやすくなります。天国以上ではレア役で当たると上のモードに残ります</li>
+        </ul>
+        <h3 class="mt-5 text-sm font-bold">ハイビスカスの光り方</h3>
+        <ul class="mt-2 grid gap-1 text-xs leading-relaxed text-slate-300">
+          {LAMPS.map(([n, m, c]) => <li class="flex items-center justify-between gap-2"><span>{n}</span><span class={`dk-tag ${c}`}>{m}</span></li>)}
+          <li class="flex items-center justify-between gap-2"><span>しなのちゃんランプ（ボーナス中）</span><span class="dk-tag s">1G連 確定</span></li>
+        </ul>
+        <ul class="mt-3 grid gap-1 text-xs leading-relaxed text-slate-400">
+          <li>・役・恩恵・モードは初代 沖ドキ！ の解析値、演出は沖ドキ！GOLD にならっています。確率と機械割は連チャンを含めた理論値です（機械割は初代と 0.5 以内）</li>
+          <li>・どの役でもボーナスを抽選していて、当たりやすさはモードで決まります（通常A・通常B・チャンス・引き戻し・保障・天国・ドキドキ・超ドキドキ）。保障以上なら次は 32G 以内に当たります。天井は通常A・B が 999G、チャンス・引き戻しが 100〜199G（その次のゲームで当たり）</li>
+          <li>・偶数設定のほうが天国に上がりやすく、天国に残りやすいのは奇数設定です（天国から落ちたとき引き戻しに行きやすいのは偶数設定）。チャンスは設定変更（週替わり）のときだけ。共通ベルは設定が上がるほど出やすくなります</li>
+          <li>・通常時の押し順ベルは取りこぼします（ハズレ目。{oneIn(KOBOSHI_N)} で 1枚出ます）</li>
+          <li>・ハイビスカスは、天井ならその場、レア役で当たると次のゲーム、リプレイ・ベルなら半々でその場か次のゲームで光ります。その場のときはたいてい第3リールの後、10回に3回はレバーで光ります。ロングフリーズは BIG＋超ドキドキ確定、遅れ・先チカ・無音・フラッシュもボーナス確定のプレミアです</li>
+          <li>・ボーナスは押し順ナビの AT です。ストップボタンに出る数字の順に押すとベルが揃います（{PAYOUT.bell}枚。最初に押すリールは声でも「ヒダリ！」「ナカ！」「ミギ！」と知らせます）。外すと {PAYOUT.bell_miss}枚です。BIG は {AT_GAMES.big}G で約210枚、REG は {AT_GAMES.reg}G で約90枚</li>
+          <li>・ボーナス中のチェリー（1.17%）・スイカ（4.69%）・確定系の役（100%）で 1G連（しなのちゃんランプが光り、次は BIG）。確定系の役はモードの昇格も抽選します。保障以上に入ると 1/8 で規定ゲーム数が 0G になり、これも 1G連 です</li>
+          <li>・台は12台。モードは人ごと・台ごとに残るので、移っても戻れば続きから打てます（光っているあいだは移れません。次ゲーム告知を待っているあいだは移れて、戻れば光ります）。週が変わると設定変更です</li>
+          <li>・ウェイト {TIMING.waitMs / 1000}秒、引き込みは最大 {TIMING.maxSlide}コマ。1日 {DAILY_GAME_LIMIT.toLocaleString('en-US')}回転まで（ボーナス中のゲームは数えません）</li>
+        </ul>
+      </div>
+      <div class="min-w-0">
+        <h2 class="text-lg font-bold">配当表 <span class="text-xs font-normal text-slate-500">5ライン・3枚掛け</span></h2>
+        <div class="mt-3 overflow-x-auto">
+          <table class="dk-table dk-paytable">
+            <thead><tr><th>図柄</th><th>役</th><th>払い出し</th><th>確率</th></tr></thead>
+            <tbody>
+              {roles.map((r) => (
+                <tr>
+                  <td><span class="dk-pay-syms">{r.sym.map((s) => s ? <svg class="dk-mini" role="img" aria-label={SYM_NAME[s]}><use href={`#dk-${s}`} /></svg> : <span class="dk-mini dk-any">ANY</span>)}</span></td>
+                  <td>{r.name}</td><td class="tabular-nums">{r.pay}</td><td class="tabular-nums text-slate-400">{r.odds}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <p class="mt-2 text-xs text-slate-400">押し順ベルは、ナビが無いときはたまたま押し順が合ったとき（6回に1回）だけ揃います。外れると 1枚です。</p>
+        <h3 class="mt-5 text-sm font-bold">打ち方</h3>
+        <ul class="mt-2 grid gap-1 text-xs leading-relaxed text-slate-400">
+          <li>・通常時はどこで押しても大丈夫です（小役は取りこぼしません）</li>
+          <li>・ハイビスカスが光ったら、次のゲームで 7 を狙います。BIG は 7・7・7、REG は 7・7・BAR です</li>
+          <li>・ボーナス中はナビの数字の順に押します。「自動で止める」ならナビどおりに止まります</li>
+          <li>・ボーナス後 32G までに当たれば連チャン。32G を超えたら、天国は終わっています（やめどき）</li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="mt-12">
+      <h2 class="text-lg font-bold">リール配列 <span class="text-xs font-normal text-slate-500">見えるとおりの並び・リールは上から下へ流れます</span></h2>
+      <div class="mt-3 overflow-x-auto">
+        <table class="dk-table dk-reelmap">
+          <thead><tr><th>コマ</th><th>左</th><th>中</th><th>右</th></tr></thead>
+          <tbody>
+            {REELS[0].map((_, i) => (
+              <tr><th>{i + 1}</th>{REELS.map((reel) => <td><span class="dk-pay-syms"><svg class="dk-mini" role="img" aria-label={SYM_NAME[reel[i]]}><use href={`#dk-${reel[i]}`} /></svg></span></td>)}</tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <style is:global>
+    .dk-hall { display: inline-flex; gap: 2px; padding: 2px; border-radius: 9999px; background: #070a12; box-shadow: inset 0 0 0 1px #1f2937; }
+    .dk-hall a { padding: 4px 12px; border-radius: 9999px; color: #94a3b8; font-weight: 700; }
+    .dk-hall a[aria-current="page"] { background: #9d174d; color: #fff; }
+    /* 筐体：トロピカルナイト。紺から紫のグラデーションに、シアンの縁とピンクの花 */
+    .dk-cab {
+      --pink: #ff4fa3; --cyan: #1fd1ed;
+      position: relative; isolation: isolate; border-radius: 26px; padding: 14px 12px 14px; color: #f1f5f9;
+      background: linear-gradient(180deg, #0f1a3d 0%, #22104a 55%, #3b0f4a 100%);
+      box-shadow: inset 0 0 0 2px rgba(31, 209, 237, .55), 0 0 0 5px #0a0d22, 0 0 0 7px var(--pink), 0 0 30px rgba(255, 79, 163, .35), 0 24px 50px -12px #000;
+    }
+    .dk-cab::before {
+      content: ''; position: absolute; inset: 0; border-radius: inherit; z-index: -1; pointer-events: none; opacity: .5;
+      background: radial-gradient(1.5px 1.5px at 14% 22%, #fff, transparent), radial-gradient(1px 1px at 78% 14%, #c4f6ff, transparent),
+        radial-gradient(1.5px 1.5px at 88% 40%, #ffd0f0, transparent), radial-gradient(1px 1px at 6% 60%, #fff, transparent);
+    }
+    .dk-top { border-radius: 18px 18px 10px 10px; padding: 10px 8px 8px; background: linear-gradient(180deg, rgba(255, 79, 163, .12), rgba(31, 209, 237, .06)); box-shadow: inset 0 0 0 2px rgba(255, 79, 163, .7), 0 0 14px rgba(255, 79, 163, .4); transition: filter .2s; }
+    .dk-sign { text-align: center; line-height: 1.05; }
+    .dk-sign b { display: block; font: 400 1.75rem 'Mochiy Pop One', 'Hiragino Maru Gothic ProN', sans-serif; color: #fff; text-shadow: 0 0 6px var(--pink), 0 0 18px var(--pink); letter-spacing: .04em; }
+    .dk-sign i { font: 400 .62rem 'Righteous', sans-serif; font-style: normal; letter-spacing: .4em; color: #8ff3ff; text-shadow: 0 0 8px var(--cyan); }
+    .dk-hibi { display: flex; justify-content: center; gap: clamp(2px, 1.2vw, 8px); margin-top: 8px; }
+    .dk-hibi img { width: clamp(40px, 13vw, 64px); height: auto; filter: grayscale(.85) brightness(.32); transition: filter .05s, transform .05s; }
+    .dk-hibi img.on { filter: drop-shadow(0 0 10px #ff4fa3) drop-shadow(0 0 22px rgba(255, 79, 163, .7)); transform: scale(1.06); }
+    .dk-hibi img.on.rb { filter: hue-rotate(var(--h, 0deg)) saturate(1.5) drop-shadow(0 0 14px #fff); }
+    .dk-top.off { filter: brightness(.18); }
+    .dk-subl { display: flex; justify-content: center; margin-top: 6px; }
+    .dk-dlamp { font: 400 .68rem 'Righteous', sans-serif; letter-spacing: .14em; padding: 3px 12px; border-radius: 9999px; border: 2px solid rgba(255, 201, 77, .3); color: rgba(255, 201, 77, .35); background: rgba(0, 0, 0, .35); }
+    .dk-dlamp.on { color: #1a0f00; background: #ffc94d; border-color: #ffc94d; box-shadow: 0 0 16px #ffc94d; }
+    .dk-mid { margin-top: 10px; display: grid; grid-template-columns: 1fr 22%; gap: 8px; align-items: stretch; }
+    .dk-window { border-radius: 12px; padding: 8px; background: #05040f; box-shadow: inset 0 0 0 2px var(--cyan), 0 0 12px rgba(31, 209, 237, .5); }
+    .dk-reels { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; }
+    .dk-reel { --cell: clamp(46px, 14vw, 64px); position: relative; height: calc(var(--cell) * 3); overflow: hidden; border-radius: 6px; background: linear-gradient(90deg, #cfd3da, #fbfbfd 22%, #fff 50%, #fbfbfd 78%, #cfd3da); }
+    .dk-reel::after { content: ''; position: absolute; inset: 0; pointer-events: none; background: linear-gradient(180deg, rgba(0,0,0,.34), rgba(0,0,0,0) 24%, rgba(0,0,0,0) 76%, rgba(0,0,0,.34)); }
+    .dk-strip { position: absolute; left: 0; right: 0; top: 0; will-change: transform; }
+    .dk-cell { height: var(--cell); display: flex; align-items: center; justify-content: center; }
+    .dk-cell svg { width: 90%; height: 86%; overflow: visible; }
+    .dk-cell.seven { position: relative; z-index: 1; }
+    .dk-cell.seven svg { width: 100%; height: 118%; }
+    .dk-cell.win { position: relative; z-index: 2; background: radial-gradient(closest-side, rgba(255, 236, 140, .75), rgba(255, 236, 140, 0)); }
+    .dk-cell.win svg { animation: dk-win .28s ease-in-out 6 alternate; }
+    .dk-cell.win-big { background: radial-gradient(closest-side, rgba(255, 120, 200, .8), rgba(255, 120, 200, 0)); }
+    @keyframes dk-win { to { transform: scale(1.14); filter: brightness(1.3) drop-shadow(0 0 8px #fff3a6); } }
+    @media (prefers-reduced-motion: reduce) { .dk-cell.win svg { animation: none; } }
+    .dk-kana { border-radius: 12px; overflow: hidden; background: #120a24; box-shadow: inset 0 0 0 2px rgba(255, 79, 163, .45); display: grid; place-items: center; }
+    .dk-kana img { width: 100%; height: 100%; object-fit: cover; object-position: center top; filter: grayscale(.7) brightness(.3); transition: filter .2s; }
+    .dk-kana.on { box-shadow: inset 0 0 0 2px #ffd36b, 0 0 22px rgba(255, 211, 107, .8); }
+    .dk-kana.on img { filter: none; animation: dk-glow 1s ease-in-out infinite alternate; }
+    @keyframes dk-glow { to { filter: brightness(1.25) drop-shadow(0 0 8px #ffd36b); } }
+    .dk-cab.flash { animation: dk-flash .12s steps(2) 10; }
+    @keyframes dk-flash { 50% { box-shadow: 0 0 0 7px #fff, 0 0 60px #fff; background: #3b0f4a; } }
+    .dk-cab.freeze .dk-reels { animation: dk-shake .08s linear infinite; }
+    @keyframes dk-shake { 50% { transform: translateX(2px); } }
+    @media (prefers-reduced-motion: reduce) { .dk-kana.on img, .dk-cab.flash, .dk-cab.freeze .dk-reels { animation: none; } }
+    .dk-meter { position: relative; margin-top: 10px; height: 18px; border-radius: 9999px; background: #0a0818; box-shadow: inset 0 0 0 1px #3d2f7a; overflow: hidden; }
+    .dk-meter-bar { position: absolute; inset: 0 auto 0 0; width: 0; background: linear-gradient(90deg, #ff4fa3, #ffc94d); transition: width .2s; }
+    .dk-meter-bar.over { background: #334155; }
+    .dk-meter span { position: absolute; inset: 0; display: grid; place-items: center; font-size: .66rem; font-weight: 800; letter-spacing: .06em; color: #fff; text-shadow: 0 1px 2px #000; }
+    .dk-leds { margin-top: 10px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+    .dk-led { display: grid; padding: 3px 8px; border-radius: 6px; background: #06051a; box-shadow: inset 0 0 0 1px #2d2560; }
+    .dk-led span { font-size: .56rem; letter-spacing: .16em; color: #8a84c4; }
+    .dk-led b { font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-variant-numeric: tabular-nums; font-size: 1.15rem; color: #ff9fce; text-shadow: 0 0 8px rgba(255, 79, 163, .8); text-align: right; }
+    .dk-controls { margin-top: 12px; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: end; }
+    .dk-controls button, .dk-machines button, .dk-vm button { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+    .dk-lever-box { width: 60px; height: 100px; border-radius: 14px; background: #07061a; box-shadow: inset 0 0 0 1px #2d2560; display: grid; place-items: center; }
+    .dk-lever { position: relative; width: 46px; height: 90px; }
+    .dk-lever-stick { position: absolute; left: 50%; bottom: 10px; width: 8px; height: 58px; transform: translateX(-50%); transform-origin: bottom center; border-radius: 4px; background: linear-gradient(90deg, #6b7280, #e5e7eb, #6b7280); transition: transform .07s; }
+    .dk-lever-knob { position: absolute; left: 50%; top: 4px; width: 32px; height: 32px; transform: translateX(-50%); border-radius: 9999px; background: radial-gradient(circle at 35% 30%, #fff1c4, #ffc94d 50%, #b7791f); box-shadow: 0 4px 8px rgba(0,0,0,.5), 0 0 12px rgba(255, 201, 77, .8); transition: top .07s; }
+    .dk-lever.pulled .dk-lever-knob { top: 38px; }
+    .dk-lever.pulled .dk-lever-stick { transform: translateX(-50%) scaleY(.45); }
+    .dk-lever:disabled { cursor: not-allowed; filter: grayscale(.5) brightness(.75); }
+    .dk-maxbet { border-radius: 12px; padding: 8px 14px; font-size: .72rem; font-weight: 900; letter-spacing: .12em; color: #08071a; background: linear-gradient(180deg, #a6fbff, #1fd1ed); box-shadow: 0 4px 0 #0b6b7c, 0 0 14px rgba(31, 209, 237, .7); transition: transform .05s, box-shadow .05s; }
+    .dk-maxbet.pressed { transform: translateY(3px); box-shadow: 0 1px 0 #0b6b7c; }
+    .dk-maxbet:disabled { filter: grayscale(.7) brightness(.6); }
+    .dk-stops { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+    .dk-stop { position: relative; height: 46px; border-radius: 12px; background: linear-gradient(180deg, #2f2758, #17123a); box-shadow: 0 4px 0 #08071a, inset 0 1px 0 rgba(255,255,255,.12); transition: transform .05s, box-shadow .05s; }
+    .dk-stop:not(:disabled) { background: linear-gradient(180deg, #ff8cc0, #ff2d87); box-shadow: 0 4px 0 #8c0f47, 0 0 12px rgba(255, 45, 135, .6); }
+    .dk-stop.pressed { transform: translateY(3px); box-shadow: 0 1px 0 #8c0f47; }
+    .dk-nav { position: absolute; inset: 0; display: grid; place-items: center; font: 900 1.4rem ui-monospace, Menlo, monospace; color: #fff; text-shadow: 0 0 8px #ffc94d, 0 1px 0 #000; }
+    .dk-stop.navnext { animation: dk-navpulse .5s ease-in-out infinite alternate; }
+    @keyframes dk-navpulse { to { box-shadow: 0 4px 0 #8c0f47, 0 0 22px #ffc94d; } }
+    .dk-machines { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 6px; margin-bottom: 10px; }
+    .dk-machine { border-radius: 10px; padding: 8px 0; font-weight: 800; font-size: .8rem; color: #cbd5e1; background: #1a1d27; box-shadow: inset 0 0 0 1px #3b4152; }
+    .dk-machine[aria-pressed="true"] { background: #be185d; color: #fff; box-shadow: inset 0 0 0 1px #f9a8d4; }
+    .dk-machine.blocked { opacity: .5; cursor: not-allowed; }
+    .dk-opts { margin-top: 12px; display: flex; justify-content: space-between; align-items: center; gap: 8px; font-size: .76rem; color: #cbd5e1; }
+    .dk-opts label { display: inline-flex; align-items: center; gap: 6px; }
+    .dk-opts input { accent-color: #ff4fa3; width: 16px; height: 16px; }
+    .dk-opts button { border-radius: 9999px; padding: 4px 12px; box-shadow: inset 0 0 0 1px #3d2f7a; white-space: nowrap; }
+    .dk-msg { margin-top: 10px; min-height: 1.4em; text-align: center; font-weight: 800; color: #ffb3d6; font-size: .9rem; text-shadow: 0 0 8px rgba(255, 79, 163, .5); }
+    .dk-msg.good { color: #fde68a; }
+    .dk-keys { margin-top: 2px; text-align: center; font-size: .66rem; color: #7d76b0; }
+    .dk-data { border-radius: 16px; padding: 16px; background: rgba(15, 23, 42, .6); box-shadow: inset 0 0 0 1px #1e293b; min-width: 0; }
+    .dk-data-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px; font-size: .8rem; font-weight: 700; }
+    .dk-switches { margin-top: 10px; display: grid; gap: 8px; justify-items: start; }
+    .dk-vm { width: 100%; display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 2px; border-radius: 12px; padding: 2px; background: #070a12; box-shadow: inset 0 0 0 1px #1f2937; }
+    .dk-vm button { border-radius: 9px; padding: 5px 0; font-size: .78rem; font-weight: 700; color: #94a3b8; font-variant-numeric: tabular-nums; }
+    .dk-vm button[aria-pressed="true"] { background: #334155; color: #f8fafc; }
+    @media (max-width: 520px) { .dk-vm { grid-template-columns: repeat(6, minmax(0, 1fr)); } }
+    @media (hover: none) { .dk-keys { display: none; } }
+    .dk-seg { display: inline-flex; border-radius: 9999px; padding: 2px; background: #070a12; box-shadow: inset 0 0 0 1px #1f2937; }
+    .dk-seg button { border-radius: 9999px; padding: 4px 11px; font-size: .78rem; font-weight: 700; color: #94a3b8; }
+    .dk-seg button[aria-pressed="true"] { background: #334155; color: #f8fafc; }
+    .dk-players td.dk-player { display: flex; align-items: center; gap: 8px; text-align: left; max-width: 14rem; }
+    .dk-counts { margin-top: 12px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+    .dk-counts div, .dk-rates div { border-radius: 10px; padding: 8px; background: #070a12; box-shadow: inset 0 0 0 1px #1f2937; text-align: center; }
+    .dk-counts span, .dk-rates span { display: block; font-size: .62rem; letter-spacing: .08em; color: #94a3b8; }
+    .dk-counts b { font-family: ui-monospace, Menlo, monospace; font-variant-numeric: tabular-nums; font-size: 1.4rem; }
+    .dk-rates { margin-top: 8px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+    .dk-rates b { font-variant-numeric: tabular-nums; font-size: 1rem; }
+    .dk-graph-wrap { margin-top: 6px; border-radius: 10px; background: #050810; box-shadow: inset 0 0 0 1px #1f2937; }
+    .dk-graph { display: block; width: 100%; height: auto; }
+    .dk-history { margin-top: 6px; display: grid; gap: 4px; font-size: .8rem; font-variant-numeric: tabular-nums; max-height: 9.5rem; overflow-y: auto; }
+    .dk-history li { display: grid; grid-template-columns: 2.6rem 3.2rem 2.6rem 1fr; gap: 8px; }
+    .dk-table { width: 100%; border-collapse: collapse; font-size: .82rem; font-variant-numeric: tabular-nums; }
+    .dk-table th, .dk-table td { padding: 6px 8px; text-align: right; border-bottom: 1px solid #1e293b; white-space: nowrap; }
+    .dk-table thead th { font-size: .7rem; font-weight: 600; color: #94a3b8; }
+    .dk-table tbody th { text-align: left; color: #e2e8f0; }
+    .dk-table td:first-child { text-align: left; }
+    .dk-spec tbody th { text-align: center; }
+    .dk-paytable td:nth-child(2) { text-align: left; white-space: normal; min-width: 10rem; }
+    .dk-reelmap { width: auto; }
+    .dk-reelmap th, .dk-reelmap td { text-align: center !important; padding-top: 1px; padding-bottom: 1px; }
+    .dk-reelmap tbody th { color: #94a3b8; font-weight: 500; }
+    .dk-pay-syms { display: inline-flex; gap: 2px; padding: 2px 4px; border-radius: 6px; background: #f8fafc; }
+    .dk-mini { width: 30px; height: 24px; display: inline-flex; align-items: center; justify-content: center; }
+    .dk-any { font-size: .5rem; font-weight: 800; color: #94a3b8; }
+    .dk-tag { font-size: .68rem; border-radius: 6px; padding: 1px 8px; background: #334155; color: #e2e8f0; white-space: nowrap; }
+    .dk-tag.t { background: #0e7490; color: #fff; }
+    .dk-tag.d { background: #b45309; color: #fff; }
+    .dk-tag.s { background: #be185d; color: #fff; }
+  </style>
+
+  <script>
+    import { AT_GAMES, BET, COIN_PT, GRAPH_EVERY, LINES, MACHINES, ORDERS, PAYOUT, REELS, TIMING, aimPress, chooseStop, lineHits, shows, type Role, type Target } from '../lib/doki.ts';
+
+    const origin = (document.getElementById('doki-root') as HTMLElement).dataset.origin ?? '';
+    const TOKEN_KEY = 'pv_poker_token';
+    {
+      const m = location.hash.match(/pv_token=([^&]+)/);
+      if (m) { try { localStorage.setItem(TOKEN_KEY, decodeURIComponent(m[1])); } catch { /* 保存できなくても続ける */ } history.replaceState(null, '', location.pathname + location.search); }
+    }
+    const token = () => { try { return localStorage.getItem(TOKEN_KEY); } catch { return null; } };
+    const api = async (path: string, method = 'GET', body?: unknown) => {
+      const t = token();
+      const headers: Record<string, string> = t ? { authorization: `Bearer ${t}` } : {};
+      if (body !== undefined) headers['content-type'] = 'application/json';
+      const r = await fetch(`${origin}${path}`, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+      const data = await r.json().catch(() => ({}));
+      return { status: r.status, ok: r.ok, body: data };
+    };
+    const $ = (id: string) => document.getElementById(id) as HTMLElement;
+    const fmt = (n: number) => Number(n).toLocaleString('en-US');
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const N = 21;
+    const mod = (n: number) => ((n % N) + N) % N;
+
+    // ===== 音（すべてここで合成するオリジナル。弦の音はウクレレ・三線っぽく、曲は琉球音階）=====
+    let ac: AudioContext | null = null;
+    let master: GainNode | null = null;
+    let soundOn = true;
+    try { soundOn = localStorage.getItem('pv_slot_sound') !== 'off'; } catch { /* 既定は音あり */ }
+    function audio() {
+      if (!ac) {
+        const AC = window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+        if (!AC) return null;
+        ac = new AC();
+        master = ac.createGain();
+        master.gain.value = 0.32;
+        master.connect(ac.destination);
+      }
+      if (ac.state === 'suspended') ac.resume();
+      return ac;
+    }
+    function tone(freq: number, start: number, dur: number, o: { type?: OscillatorType; vol?: number; slide?: number } = {}) {
+      if (!soundOn || !audio() || !ac || !master) return;
+      const { type = 'square', vol = 0.25, slide = 0 } = o;
+      const t0 = ac.currentTime + start;
+      const osc = ac.createOscillator();
+      const g = ac.createGain();
+      osc.type = type;
+      osc.frequency.setValueAtTime(freq, t0);
+      if (slide) osc.frequency.exponentialRampToValueAtTime(Math.max(30, freq * slide), t0 + dur);
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(vol, t0 + 0.004);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      osc.connect(g).connect(master);
+      osc.start(t0);
+      osc.stop(t0 + dur + 0.02);
+    }
+    function noise(start: number, dur: number, o: { vol?: number; freq?: number; q?: number; type?: BiquadFilterType } = {}) {
+      if (!soundOn || !audio() || !ac || !master) return;
+      const { vol = 0.3, freq = 1200, q = 0.8, type = 'lowpass' } = o;
+      const t0 = ac.currentTime + start;
+      const len = Math.max(1, Math.floor(ac.sampleRate * dur));
+      const buf = ac.createBuffer(1, len, ac.sampleRate);
+      const ch = buf.getChannelData(0);
+      for (let i = 0; i < len; i++) ch[i] = (Math.random() * 2 - 1) * (1 - i / len);
+      const src = ac.createBufferSource();
+      src.buffer = buf;
+      const f = ac.createBiquadFilter();
+      f.type = type; f.frequency.value = freq; f.Q.value = q;
+      const g = ac.createGain();
+      g.gain.value = vol;
+      src.connect(f).connect(g).connect(master);
+      src.start(t0);
+    }
+    const NOTE = (n: number) => 440 * Math.pow(2, (n - 69) / 12);
+    /**
+     * はじいた弦の音（Karplus-Strong 法で合成する）。ウクレレ・三線っぽい音色。
+     * bright を上げるとはじいた瞬間が明るく、decay を上げると長く鳴る
+     */
+    function pluck(midi: number, start: number, dur: number, o: { vol?: number; bright?: number; decay?: number } = {}) {
+      if (!soundOn || !audio() || !ac || !master) return;
+      const { vol = 0.22, bright = 0.6, decay = 0.996 } = o;
+      const sr = ac.sampleRate;
+      const len = Math.max(1, Math.floor(sr * dur));
+      const buf = ac.createBuffer(1, len, sr);
+      const y = buf.getChannelData(0);
+      const p = Math.max(2, Math.round(sr / NOTE(midi)));
+      // はじいた瞬間のノイズを少しなめらかにして（bright が低いほど丸い音）、遅延線で回す
+      let prev = 0;
+      for (let i = 0; i < p && i < len; i++) { const w = Math.random() * 2 - 1; prev = bright * w + (1 - bright) * prev; y[i] = prev; }
+      for (let i = p; i < len; i++) y[i] = decay * 0.5 * (y[i - p] + y[i - p - 1 >= 0 ? i - p - 1 : 0]);
+      const src = ac.createBufferSource();
+      src.buffer = buf;
+      const g = ac.createGain();
+      const t0 = ac.currentTime + start;
+      g.gain.setValueAtTime(vol, t0);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+      src.connect(g).connect(master);
+      src.start(t0);
+    }
+    /** ウクレレのストローク（下から上へ順に少しずらしてはじく） */
+    function strum(notes: readonly number[], start: number, o: { gap?: number; dur?: number; vol?: number; bright?: number } = {}) {
+      const { gap = 0.018, dur = 0.7, vol = 0.14, bright = 0.55 } = o;
+      notes.forEach((n, i) => pluck(n, start + i * gap, dur, { vol, bright, decay: 0.995 }));
+    }
+    // 琉球音階（ド・ミ・ファ・ソ・シ）のコード。ウクレレの開放弦（G C E A）に近い押さえ
+    const CH = { C: [67, 60, 64, 72], F: [69, 65, 72, 77], G: [67, 62, 71, 74], Em: [67, 64, 71, 76] } as const;
+    const SE = {
+      bet(n: number) { for (let i = 0; i < n; i++) { tone(2637, i * 0.07, 0.05, { type: 'triangle', vol: 0.1 }); tone(3520, i * 0.07 + 0.015, 0.04, { type: 'sine', vol: 0.06 }); } },
+      lever() { noise(0, 0.04, { vol: 0.45, freq: 1800, type: 'bandpass', q: 3 }); pluck(48, 0, 0.18, { vol: 0.12, bright: 0.3, decay: 0.98 }); },
+      // リールが回り始める：ウクレレのポロロン
+      start() { strum([67, 72, 76, 79], 0, { gap: 0.03, dur: 0.6, vol: 0.12 }); },
+      // ストップ：木を叩いたような軽い音
+      stop() { pluck(84, 0, 0.08, { vol: 0.12, bright: 0.9, decay: 0.95 }); noise(0, 0.02, { vol: 0.18, freq: 2600, type: 'bandpass', q: 3 }); },
+      coin(i = 0) { pluck(i % 2 ? 95 : 91, 0, 0.09, { vol: 0.08, bright: 0.9, decay: 0.97 }); },
+      // 当たり（ハイビスカスが光る）：かき鳴らしと、琉球音階の駆け上がり
+      hit() {
+        strum(CH.C, 0, { gap: 0.012, dur: 1.2, vol: 0.16, bright: 0.8 });
+        [72, 76, 77, 79, 83, 84].forEach((n, i) => pluck(n + 12, 0.08 + i * 0.045, 0.5, { vol: 0.11, bright: 0.85 }));
+      },
+      // 点滅に合わせた短い音
+      blip() { pluck(96, 0, 0.12, { vol: 0.05, bright: 0.9, decay: 0.98 }); },
+      // ドキドキランプ：心臓の音（ドクン、ドクン）
+      heart() { for (const t of [0, 0.22, 0.7, 0.92]) { tone(62, t, 0.16, { type: 'sine', vol: 0.5, slide: 0.6 }); noise(t, 0.06, { vol: 0.3, freq: 180, q: 1 }); } },
+      // しだれ柳：きらきら（高い音を降らせる）
+      sparkle() { for (let i = 0; i < 14; i++) pluck([96, 95, 91, 89, 88, 84][i % 6], i * 0.07, 0.4, { vol: 0.06, bright: 0.95 }); },
+      // しなのちゃんランプ（1G連）
+      kana() { strum(CH.F, 0, { gap: 0.015, dur: 1, vol: 0.14, bright: 0.8 }); [77, 79, 83, 84, 88, 89, 91].forEach((n, i) => pluck(n + 12, 0.1 + i * 0.06, 0.5, { vol: 0.1, bright: 0.85 })); },
+      replay() { pluck(84, 0, 0.18, { vol: 0.1, bright: 0.7 }); pluck(88, 0.08, 0.22, { vol: 0.1, bright: 0.7 }); },
+      buzz() { tone(110, 0, 0.18, { type: 'sawtooth', vol: 0.12 }); },
+      nav() { pluck(91, 0, 0.15, { vol: 0.08, bright: 0.8 }); },
+      // 役が揃ったときの音。ベル：鈴のような2音、スイカ：太鼓、チェリー：短いはじき
+      bell() { for (const [n, t] of [[88, 0], [95, 0.07], [100, 0.14]] as const) pluck(n, t, 0.5, { vol: 0.09, bright: 0.95, decay: 0.997 }); },
+      suika() { tone(95, 0, 0.32, { type: 'sine', vol: 0.45, slide: 0.55 }); noise(0, 0.05, { vol: 0.25, freq: 300, q: 1 }); tone(140, 0.16, 0.22, { type: 'sine', vol: 0.3, slide: 0.6 }); },
+      cherry() { pluck(84, 0, 0.25, { vol: 0.1, bright: 0.85 }); pluck(91, 0.06, 0.3, { vol: 0.09, bright: 0.85 }); },
+      // フリーズ：低いうなりと、風の音
+      freeze() { tone(55, 0, 2.5, { type: 'sawtooth', vol: 0.12 }); noise(0, 2.4, { vol: 0.12, freq: 500, q: 0.6 }); },
+      // フラッシュ（確定役）：パシャ
+      flash() { noise(0, 0.08, { vol: 0.4, freq: 4000, type: 'bandpass', q: 4 }); pluck(100, 0, 0.2, { vol: 0.06, bright: 1 }); },
+    };
+    // ボーナス中の BGM（琉球音階のオリジナル。ウクレレのメロディに、低い弦の刻み・カッティング・シェイカー）。[MIDI 番号, 拍]
+    const BGM: Record<string, { bpm: number; melody: number[][]; chords: (keyof typeof CH)[] }> = {
+      big: {
+        bpm: 132,
+        melody: [
+          [72, .5], [76, .5], [77, .5], [79, 1], [77, .5], [76, .5], [72, .5], [71, 1], [72, 1.5], [0, .5],
+          [79, .5], [83, .5], [84, 1], [83, .5], [79, .5], [77, 1], [76, .5], [77, .5], [79, 1.5], [0, .5],
+          [84, .5], [83, .5], [79, .5], [77, .5], [76, 1], [77, .5], [79, .5], [76, .5], [72, .5], [71, .5], [72, .5], [76, 1], [72, 1.5], [0, .5],
+        ],
+        chords: ['C', 'C', 'F', 'G', 'C', 'Em', 'F', 'G', 'C', 'F', 'C', 'G', 'C', 'C'],
+      },
+      reg: {
+        bpm: 120,
+        melody: [
+          [76, .5], [77, .5], [79, 1], [76, .5], [72, .5], [71, 1], [72, .5], [76, .5], [77, 1.5], [0, .5],
+          [79, .5], [77, .5], [76, .5], [72, .5], [71, 1], [67, 1], [72, 1.5], [0, .5],
+        ],
+        chords: ['C', 'F', 'G', 'C', 'F', 'G', 'C', 'C'],
+      },
+    };
+    let bgmTimer: ReturnType<typeof setTimeout> | null = null;
+    function bgmPass(key: string) {
+      const { bpm, melody, chords } = BGM[key] ?? BGM.big;
+      const beat = 60 / bpm;
+      // カチャーシーの跳ねたリズム（8分音符の表を長く、裏を短く）
+      const swing = (b: number) => Math.floor(b) + (b % 1 === 0.5 ? 0.58 : b % 1);
+      let t = 0;
+      for (const [n, b] of melody) { if (n) pluck(n, 0.02 + swing(t) * beat, Math.max(0.25, b * beat * 1.3), { vol: 0.16, bright: 0.75 }); t += b; }
+      const beats = melody.reduce((a, [, b]) => a + b, 0);
+      for (let i = 0; i < beats; i++) {
+        const c = CH[chords[Math.floor(i / 2) % chords.length]];
+        const at = 0.02 + i * beat;
+        pluck(c[1] - 12, at, beat * 0.9, { vol: 0.14, bright: 0.35, decay: 0.993 });                 // 低い弦
+        strum(c, at + 0.58 * beat, { gap: 0.008, dur: beat * 0.35, vol: 0.06, bright: 0.7 });          // 裏のカッティング
+        noise(at, 0.035, { vol: 0.06, freq: 7000, type: 'highpass' });                                   // シェイカー
+        noise(at + 0.58 * beat, 0.03, { vol: 0.045, freq: 8000, type: 'highpass' });
+      }
+      return beats * beat;
+    }
+    function startBgm(kind: string) { stopBgm(); const loop = () => { const sec = bgmPass(kind); bgmTimer = setTimeout(loop, sec * 1000 - 20); }; loop(); }
+    function stopBgm() { if (bgmTimer) { clearTimeout(bgmTimer); bgmTimer = null; } }
+    /** ボーナスのファンファーレ（琉球音階の駆け上がりをかき鳴らしで締める） */
+    function fanfare(kind: 'big' | 'reg') {
+      const seq = kind === 'big' ? [60, 64, 65, 67, 71, 72, 76, 77, 79, 83, 84] : [67, 71, 72, 76, 79];
+      seq.forEach((n, i) => pluck(n + 12, i * 0.06, 0.45, { vol: 0.13, bright: 0.85 }));
+      const end = seq.length * 0.06;
+      strum(CH.C, end, { gap: 0.012, dur: 1.4, vol: 0.18, bright: 0.85 });
+      if (kind === 'big') strum(CH.C.map((n) => n + 12), end + 0.25, { gap: 0.012, dur: 1.2, vol: 0.12, bright: 0.9 });
+      return Math.round(end * 1000) + 700;
+    }
+    function endJingle() {
+      [79, 77, 76, 72].forEach((n, i) => pluck(n + 12, i * 0.1, 0.4, { vol: 0.12, bright: 0.8 }));
+      strum(CH.G, 0.42, { vol: 0.12, dur: 0.6 });
+      strum(CH.C, 0.75, { vol: 0.16, dur: 1.3 });
+    }
+
+    const soundBtn = $('sound');
+    const showSound = () => { soundBtn.textContent = soundOn ? '🔊 音あり' : '🔇 音なし'; soundBtn.setAttribute('aria-pressed', String(soundOn)); };
+    showSound();
+    soundBtn.addEventListener('click', () => {
+      soundOn = !soundOn;
+      try { localStorage.setItem('pv_slot_sound', soundOn ? 'on' : 'off'); } catch { /* 保存できなくても切り替える */ }
+      showSound();
+      if (!soundOn) { stopBgm(); if (ac) { ac.close(); ac = null; } } else if (bonus) startBgm(bonus.kind);
+    });
+    const autoBox = $('auto') as HTMLInputElement;
+    try { autoBox.checked = localStorage.getItem('pv_doki_auto') === 'on'; } catch { /* 既定は手で止める */ }
+    autoBox.addEventListener('change', () => { try { localStorage.setItem('pv_doki_auto', autoBox.checked ? 'on' : 'off'); } catch { /* 保存できなくても切り替える */ } });
+
+    // ===== リール（pos は上段のコマ番号。回るほど減る）=====
+    interface Reel { el: HTMLElement; strip: HTMLElement; pos: number; spinning: boolean; startedAt: number; left: number; target: number | null; done: (() => void) | null }
+    const reels: Reel[] = [...document.querySelectorAll<HTMLElement>('.dk-reel')].map((el, r) => {
+      const strip = el.querySelector('.dk-strip') as HTMLElement;
+      const cells: string[] = [];
+      for (let k = 0; k < N * 2 + 3; k++) cells.push(REELS[r][k % N]);
+      strip.innerHTML = cells.map((s) => `<div class="dk-cell${s === '7' ? ' seven' : ''}"><svg><use href="#dk-${s}"/></svg></div>`).join('');
+      return { el, strip, pos: Math.floor(Math.random() * N), spinning: false, startedAt: 0, left: 0, target: null, done: null };
+    });
+    const cellPx = () => reels[0].el.clientHeight / 3;
+    function drawReel(reel: Reel) { reel.strip.style.transform = `translate3d(0, ${-Math.round(mod(reel.pos) * cellPx())}px, 0)`; }
+    reels.forEach(drawReel);
+    addEventListener('resize', () => reels.forEach(drawReel));
+    let last = performance.now();
+    function frame(t: number) {
+      const dt = Math.min(0.05, (t - last) / 1000);
+      last = t;
+      for (const reel of reels) {
+        if (!reel.spinning) continue;
+        const speed = TIMING.cellsPerSec * Math.max(0, Math.min(1, (t - reel.startedAt) / TIMING.accelMs));
+        const step = speed * dt;
+        if (reel.target != null && step >= reel.left) {
+          reel.pos = reel.target; reel.spinning = false; reel.target = null; drawReel(reel);
+          const done = reel.done; reel.done = null; done?.();
+          continue;
+        }
+        reel.pos -= step;
+        if (reel.target != null) reel.left -= step;
+        drawReel(reel);
+      }
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+    function spinAll(delayed = false) {
+      const t = performance.now();
+      reels.forEach((reel, i) => { reel.spinning = true; reel.startedAt = t + (delayed ? i * 450 : 0); reel.target = null; });
+    }
+    function stopAt(r: number, top: number): Promise<void> {
+      const reel = reels[r];
+      return new Promise((resolve) => { reel.left = mod(reel.pos - top); reel.target = top; reel.done = () => { SE.stop(); resolve(); }; });
+    }
+
+    // ===== ハイビスカス =====
+    const hibi = [...document.querySelectorAll<HTMLImageElement>('#hibi img')];
+    const top = document.querySelector('.dk-top') as HTMLElement;
+    const dlamp = $('dlamp');
+    const kana = $('kana');
+    let lampToken = 0;
+    const ALL = [1, 1, 1, 1, 1], NONE = [0, 0, 0, 0, 0];
+    const setHibi = (on: number[]) => hibi.forEach((im, i) => im.classList.toggle('on', !!on[i]));
+    function clearLamp() { lampToken++; setHibi(NONE); dlamp.classList.remove('on'); top.classList.remove('off'); hibi.forEach((im) => im.classList.remove('rb')); }
+    /** 光り方（GOLD の点灯パターンにならう）。最後は全部点いたまま */
+    async function playPattern(p: string) {
+      const my = ++lampToken;
+      const live = () => my === lampToken;
+      const blink = async (on: number[], n: number, a: number, b: number) => { for (let k = 0; k < n && live(); k++) { setHibi(on); SE.blip(); await sleep(a); setHibi(NONE); await sleep(b); } };
+      SE.hit();
+      switch (p) {
+        case 'fast': await blink(ALL, 14, 100, 80); break;
+        case 'slow': await blink(ALL, 3, 800, 600); break;
+        case 'sync': for (let k = 0; k < 7 && live(); k++) { setHibi([1, 0, 1, 0, 1]); await sleep(240); setHibi([0, 1, 0, 1, 0]); await sleep(240); } break;
+        case 'b337': for (const n of [3, 3, 7]) { await blink(ALL, n, 140, 160); await sleep(240); } break;
+        case 'right': await blink([0, 0, 0, 1, 1], 8, 240, 180); break;
+        case 'panel': for (let k = 0; k < 5 && live(); k++) { setHibi(ALL); await sleep(280); setHibi(NONE); top.classList.add('off'); await sleep(240); top.classList.remove('off'); } break;
+        case 'left': await blink([1, 1, 0, 0, 0], 8, 240, 180); break;
+        case 'reverse': for (let k = 0; k < 3 && live(); k++) { for (let i = 4; i >= 0 && live(); i--) { setHibi(NONE.map((_, j) => (j >= i ? 1 : 0))); await sleep(100); } await sleep(140); setHibi(NONE); await sleep(120); } break;
+        case 'doki': dlamp.classList.add('on'); SE.heart(); await blink(ALL, 5, 400, 280); break;
+        case 'shidare': SE.sparkle(); for (let k = 0; k < 18 && live(); k++) { hibi.forEach((im, i) => { im.classList.add('on', 'rb'); im.style.setProperty('--h', `${(k * 40 + i * 72) % 360}deg`); }); await sleep(130); } hibi.forEach((im) => im.classList.remove('rb')); break;
+        default: await blink(ALL, 4, 400, 280);
+      }
+      if (live()) setHibi(ALL);
+    }
+
+    // ===== 状態 =====
+    type Phase = 'idle' | 'spinning' | 'settling';
+    type AtGame = { role: Role; nav: number | null; stock: boolean };
+    type Spin = { role: Role; pay: number; lamp: 'pre' | 'post' | null; pattern: string | null; premium: string | null; pending: 'big' | 'reg' | null; canAlign: boolean; since: number };
+    let phase: Phase = 'idle';
+    let bet = 0;
+    let replayNext = false;
+    let lastStart = 0;
+    let tops: (number | null)[] = [null, null, null];
+    let target: Target = 'none';
+    let stopsReady = false;
+    let stopping: Promise<void>[] = [];
+    let game: Spin | null = null;
+    let bonus: { kind: 'big' | 'reg'; games: AtGame[]; idx: number; paid: number; misses: number; next: 'big' | 'reg' | null; stocked: boolean } | null = null;
+    let atGame: AtGame | null = null;
+    let pressed: number[] = [];
+    let credit = 0;
+    let available: number | null = null;
+    let since = 0;
+    let chain = 0;
+    let machine = 1;
+    let pending: 'big' | 'reg' | null = null;
+    type Counter = { games: number; diff: number; big: number; reg: number; cbell: number; since: number | null; graph: number[] };
+    type MCounter = { machine: number; mine: Counter; all: Counter; allBonuses: { kind: string; msince: number; chain: number; created_at: string }[] };
+    const emptyCounter = (s: number | null): Counter => ({ games: 0, diff: 0, big: 0, reg: 0, cbell: 0, since: s, graph: [] });
+    let counters: MCounter[] = [...MACHINES].map((m) => ({ machine: m, mine: emptyCounter(null), all: emptyCounter(0), allBonuses: [] }));
+    let viewMachine = 1;
+    let scope: 'mine' | 'all' = 'mine';
+    let bonuses: { kind: string; game: number; since: number; chain: number; machine: number }[] = [];
+    type MTot = { machine: number; games: number; big: number; reg: number; cbell: number; players: number };
+
+    function msg(text: string, good = false) { $('msg').textContent = text; $('msg').className = 'dk-msg' + (good ? ' good' : ''); }
+    function autoStop() { return autoBox.checked; }
+    function pressFx(el: Element, cls = 'pressed') { el.classList.add(cls); setTimeout(() => el.classList.remove(cls), 140); }
+    function syncCredit() { if (available != null) credit = Math.floor(available / COIN_PT); }
+    function renderLeds() {
+      $('credit').textContent = available == null ? '----' : fmt(credit);
+      $('credit-pt').textContent = available == null ? '' : `${fmt(available)} pt`;
+      $('gameLabel').textContent = bonus ? (bonus.kind === 'big' ? 'BIG' : 'REG') : 'GAME';
+      $('gameCount').textContent = bonus ? String(bonus.games.length - bonus.idx) : String(since);
+      const bar = $('meter');
+      if (bonus) { bar.style.width = `${(bonus.idx / bonus.games.length) * 100}%`; bar.classList.remove('over'); $('meterText').textContent = `${bonus.kind.toUpperCase()} 残り ${bonus.games.length - bonus.idx}G`; }
+      else if (pending) { bar.style.width = '100%'; bar.classList.remove('over'); $('meterText').textContent = '7 を狙え！'; }
+      else if (chain > 0 && since <= 32) { bar.style.width = `${(since / 32) * 100}%`; bar.classList.remove('over'); $('meterText').textContent = `連チャン ${chain} ／ ボーナス後 ${since}G（32G まで）`; }
+      else { bar.style.width = '100%'; bar.classList.add('over'); $('meterText').textContent = chain > 0 ? `ボーナス後 ${since}G（32G を超えました）` : `${since}G`; }
+      renderMachine();
+    }
+    function render() {
+      renderLeds();
+      const mc = counters[viewMachine - 1];
+      const c = scope === 'mine' ? mc.mine : mc.all;
+      $('cBig').textContent = String(c.big);
+      $('cReg').textContent = String(c.reg);
+      $('cGames').textContent = fmt(c.games);
+      $('cSince').textContent = scope === 'all' ? String(c.since ?? 0) : viewMachine === machine ? String(since) : '—';
+      $('rSum').textContent = c.big + c.reg > 0 ? `1/${(c.games / (c.big + c.reg)).toFixed(1)}` : '—';
+      $('rBell').textContent = c.cbell > 0 ? `1/${(c.games / c.cbell).toFixed(1)}` : '—';
+      const dEl = $('rDiff');
+      dEl.textContent = (c.diff > 0 ? '+' : '') + fmt(c.diff);
+      dEl.style.color = c.diff > 0 ? '#fca5a5' : c.diff < 0 ? '#93c5fd' : '';
+      drawGraph(c.graph, c.games, c.diff);
+      document.querySelectorAll<HTMLElement>('[data-view-machine]').forEach((b) => b.setAttribute('aria-pressed', String(Number(b.dataset.viewMachine) === viewMachine)));
+      document.querySelectorAll<HTMLElement>('[data-scope]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.scope === scope)));
+      $('histLabel').textContent = scope === 'mine' ? '自分' : 'みんな';
+      const hhmm = (iso: string) => new Date(Date.parse(iso) + 9 * 3600_000).toISOString().slice(11, 16);
+      const kindHtml = (k: string) => `<b style="color:${k === 'big' ? '#f87171' : '#7dd3fc'}">${k.toUpperCase()}</b>`;
+      const chainHtml = (n: number) => (n > 1 ? `<span class="text-pink-300">🌺${n}連</span>` : '<span></span>');
+      const items = scope === 'mine'
+        ? bonuses.filter((b) => b.machine === viewMachine).map((b) => `<li>${kindHtml(b.kind)}<span>${b.since}G</span>${chainHtml(b.chain)}<span class="text-slate-500">${b.game}回転目</span></li>`)
+        : mc.allBonuses.map((b) => `<li>${kindHtml(b.kind)}<span>${b.msince}G</span>${chainHtml(b.chain)}<span class="text-slate-500">${hhmm(b.created_at)}</span></li>`);
+      $('history').innerHTML = items.length ? items.join('') : '<li class="text-slate-500">まだありません</li>';
+    }
+    function drawGraph(graph: number[], games: number, diff: number) {
+      const svg = $('graph');
+      const W = 400, H = 200, L = 44, R = 8, T = 10, B = 22;
+      const pts = [0, ...graph];
+      const xs = pts.map((_, i) => i * GRAPH_EVERY);
+      if (games % GRAPH_EVERY !== 0 || graph.length === 0) { pts.push(diff); xs.push(games); }
+      const maxAbs = Math.max(100, ...pts.map((v) => Math.abs(v)));
+      const step = [100, 200, 250, 500, 1000, 2000, 2500, 5000].find((s) => maxAbs / s <= 4) ?? 10000;
+      const topV = Math.ceil(maxAbs / step) * step;
+      const maxX = Math.max(100, xs[xs.length - 1]);
+      const xStep = [50, 100, 200, 250, 500, 1000].find((s) => maxX / s <= 5) ?? 1000;
+      const xMax = Math.ceil(maxX / xStep) * xStep;
+      const sx = (x: number) => L + (x / xMax) * (W - L - R);
+      const sy = (v: number) => T + ((topV - v) / (2 * topV)) * (H - T - B);
+      let g = '';
+      for (let v = -topV; v <= topV; v += step) {
+        g += `<line x1="${L}" x2="${W - R}" y1="${sy(v)}" y2="${sy(v)}" stroke="${v === 0 ? '#64748b' : '#1e293b'}" stroke-width="${v === 0 ? 1.2 : 1}"/>`;
+        g += `<text x="${L - 6}" y="${sy(v) + 3.5}" text-anchor="end" font-size="10" fill="#94a3b8">${v > 0 ? '+' : ''}${v}</text>`;
+      }
+      for (let x = 0; x <= xMax; x += xStep) g += `<text x="${sx(x)}" y="${H - 6}" text-anchor="middle" font-size="10" fill="#94a3b8">${x}</text>`;
+      g += `<polyline points="${pts.map((v, i) => `${sx(xs[i]).toFixed(1)},${sy(v).toFixed(1)}`).join(' ')}" fill="none" stroke="#f472b6" stroke-width="2" stroke-linejoin="round"/>`;
+      g += `<circle cx="${sx(xs[xs.length - 1])}" cy="${sy(pts[pts.length - 1])}" r="3.5" fill="#f9a8d4"/>`;
+      svg.innerHTML = g;
+    }
+    function renderDays(days: { day: string; games: number; diff: number; big: number; reg: number }[]) {
+      $('days').innerHTML = days.length
+        ? days.map((d) => `<tr><td>${Number(d.day.slice(5, 7))}/${Number(d.day.slice(8))}</td><td>${fmt(d.games)}</td><td>${d.big}</td><td>${d.reg}</td><td style="color:${d.diff > 0 ? '#fca5a5' : d.diff < 0 ? '#93c5fd' : ''}">${d.diff > 0 ? '+' : ''}${fmt(d.diff)}</td></tr>`).join('')
+        : '<tr><td colspan="5" class="text-slate-500">—</td></tr>';
+    }
+    function moveBlock(): string | null {
+      if (pending) return 'ハイビスカスが光っているあいだは台を移れません。7 を揃えてから移ってください';
+      if (bonus) return 'ボーナス中は台を移れません';
+      if (phase !== 'idle') return 'リールが止まってから移ってください';
+      if (replayNext) return 'リプレイのゲームを回してから移ってください';
+      return null;
+    }
+    function renderMachine() {
+      document.querySelectorAll<HTMLButtonElement>('[data-machine]').forEach((b) => {
+        b.setAttribute('aria-pressed', String(Number(b.dataset.machine) === machine));
+        b.classList.toggle('blocked', !!moveBlock());
+      });
+    }
+    const oneInText = (games: number, n: number) => (n > 0 ? `1/${(games / n).toFixed(1)}` : '—');
+    function renderMachines(m: { today: MTot[]; week: MTot[] } | undefined) {
+      if (!m) return;
+      for (const [span, rows] of [['today', m.today], ['week', m.week]] as const) {
+        for (const x of rows) {
+          const tr = document.querySelector(`[data-mrow="${span}-${x.machine}"]`);
+          if (!tr) continue;
+          const set = (k: string, v: string) => { const td = tr.querySelector(`[data-k="${k}"]`); if (td) td.textContent = v; };
+          set('games', fmt(x.games)); set('big', String(x.big)); set('reg', String(x.reg));
+          set('sum', oneInText(x.games, x.big + x.reg)); set('cbell', oneInText(x.games, x.cbell)); set('players', String(x.players));
+        }
+      }
+    }
+    document.querySelectorAll<HTMLButtonElement>('[data-period]').forEach((b) => b.addEventListener('click', () => {
+      document.querySelectorAll<HTMLElement>('[data-period]').forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      document.querySelectorAll<HTMLElement>('[data-period-panel]').forEach((p) => { p.hidden = p.dataset.periodPanel !== b.dataset.period; });
+    }));
+    document.querySelectorAll<HTMLButtonElement>('[data-view-machine]').forEach((b) => b.addEventListener('click', () => { viewMachine = Number(b.dataset.viewMachine); render(); }));
+    document.querySelectorAll<HTMLButtonElement>('[data-scope]').forEach((b) => b.addEventListener('click', () => { scope = b.dataset.scope === 'all' ? 'all' : 'mine'; render(); }));
+
+    function applyState(d: { machine: number; pending: 'big' | 'reg' | null; since: number; chain: number; counters?: MCounter[]; machines?: { today: MTot[]; week: MTot[] }; bonuses?: typeof bonuses; days?: { day: string; games: number; diff: number; big: number; reg: number }[]; available?: number }) {
+      machine = d.machine ?? 1; viewMachine = machine;
+      pending = d.pending; since = d.since ?? 0; chain = d.chain ?? 0;
+      if (Array.isArray(d.counters) && d.counters.length === 6) counters = d.counters;
+      if (d.bonuses) bonuses = d.bonuses;
+      if (d.days) renderDays(d.days);
+      if (d.available != null) available = d.available;
+      renderMachines(d.machines);
+      clearLamp();
+      if (pending) { setHibi(ALL); msg('ハイビスカスが光っています。7 を狙って揃えましょう', true); }
+    }
+    async function refreshShared() {
+      try {
+        const r = await api('/api/doki/state');
+        if (!r.ok) return;
+        renderMachines(r.body.machines);
+        if (Array.isArray(r.body.counters)) counters = counters.map((c, i) => ({ ...c, all: r.body.counters[i].all, allBonuses: r.body.counters[i].allBonuses }));
+        if (phase === 'idle' && !bonus) render();
+      } catch { /* 読めなくても続ける */ }
+    }
+    setInterval(() => { if (token() && document.visibilityState === 'visible' && phase === 'idle' && !bonus) refreshShared(); }, 30_000);
+
+    async function moveTo(m: number) {
+      if (m === machine || !token()) return;
+      const why = moveBlock();
+      if (why) { SE.buzz(); msg(why); return; }
+      if (bet > 0) { credit += bet; bet = 0; renderLeds(); }
+      let r;
+      try { r = await api('/api/doki/machine', 'POST', { machine: m }); } catch { r = { ok: false, status: 0, body: {} }; }
+      if (!r.ok) { msg(r.body.reason === 'pending' ? 'ハイビスカスが光っているあいだは台を移れません' : '台を移れませんでした'); return; }
+      applyState(r.body);
+      msg(`台${m}に移りました`);
+      render();
+    }
+    document.querySelectorAll<HTMLButtonElement>('[data-machine]').forEach((b) => b.addEventListener('click', () => { audio(); moveTo(Number(b.dataset.machine)); }));
+
+    function setControls(enabled: boolean) { ($('lever') as HTMLButtonElement).disabled = !enabled; ($('maxbet') as HTMLButtonElement).disabled = !enabled; }
+    async function loadState() {
+      if (!token()) { msg('右上の「Discord でログイン」から入ると遊べます'); setControls(false); render(); return; }
+      try {
+        const r = await api('/api/doki/state');
+        if (r.status === 401) { try { localStorage.removeItem(TOKEN_KEY); } catch { /* 消せなくても続ける */ } msg('ログインが切れました。もう一度ログインしてください'); setControls(false); return; }
+        if (!r.ok) { msg('台の様子を読み込めませんでした'); return; }
+        applyState(r.body);
+        syncCredit();
+        render();
+      } catch { msg('台の様子を読み込めませんでした'); }
+    }
+    const REASON: Record<string, string> = {
+      insufficient: `使えるポイントが足りません（${BET * COIN_PT}pt）`,
+      limit: '今日はここまで（1日の回転数の上限です）',
+    };
+
+    function maxBet(auto = false) {
+      if (phase !== 'idle' || bet > 0 || !token()) return;
+      if (!bonus && !replayNext && available != null && available < BET * COIN_PT) { SE.buzz(); msg(REASON.insufficient); return; }
+      audio();
+      bet = BET;
+      if (!auto) pressFx($('maxbet'));
+      if (replayNext) replayNext = false; else { SE.bet(BET); credit -= BET; }
+      if (!bonus) $('pay').textContent = '0';
+      renderLeds();
+    }
+    // 押し順ナビの声（「ヒダリ！」「ナカ！」「ミギ！」。Soniox で合成した女の子の声を /doki/voice に置いてある）
+    const VOICE_FILES = ['hidari', 'naka', 'migi'];
+    let voiceBufs: (AudioBuffer | null)[] | null = null;
+    function loadVoices() {
+      const c = audio();
+      if (voiceBufs || !c) return;
+      voiceBufs = [null, null, null];
+      VOICE_FILES.forEach((f, i) => {
+        fetch(`/doki/voice/${f}.mp3`).then((r) => r.arrayBuffer()).then((b) => c.decodeAudioData(b))
+          .then((buf) => { if (voiceBufs) voiceBufs[i] = buf; }).catch(() => { /* 読めなければ合図の音だけ */ });
+      });
+    }
+    let voiceSrc: AudioBufferSourceNode | null = null;
+    function callNav(r: number | undefined) {
+      if (r == null || !soundOn) return;
+      const buf = voiceBufs?.[r];
+      if (!buf || !ac || !master) { SE.nav(); return; }
+      try { voiceSrc?.stop(); } catch { /* もう止まっている */ }
+      const src = ac.createBufferSource();
+      const g = ac.createGain();
+      g.gain.value = 2.2; // 声は合成音より大きめに
+      src.buffer = buf;
+      src.connect(g).connect(master);
+      src.start();
+      voiceSrc = src;
+    }
+    // 役が揃ったときの演出：揃ったライン（チェリーは左リールのチェリー）の絵柄を光らせて、役ごとの音を鳴らす
+    let winTimer: ReturnType<typeof setTimeout> | null = null;
+    function clearWin() { if (winTimer) { clearTimeout(winTimer); winTimer = null; } document.querySelectorAll('.dk-cell.win').forEach((c) => c.classList.remove('win', 'win-big')); }
+    function winFx(f: number[], role: Role) {
+      clearWin();
+      const cells: [number, number][] = [];
+      if (role === 'cherry' || role === 'kcherry' || role === 'mcherry') {
+        for (let row = 0; row < 3; row++) if (REELS[0][(f[0] + row) % REELS[0].length] === 'C') cells.push([0, row]);
+      } else if (['bell', 'cbell', 'suika', 'replay'].includes(role)) {
+        for (const h of lineHits(f)) LINES[h.line].forEach((row, r) => cells.push([r, row]));
+      }
+      if (!cells.length) return;
+      for (const [r, row] of cells) {
+        const el = reels[r].strip.children[f[r] + row] as HTMLElement | undefined;
+        el?.classList.add('win');
+        if (role === 'cbell' || role === 'kcherry' || role === 'mcherry') el?.classList.add('win-big');
+      }
+      if (role === 'bell' || role === 'cbell') SE.bell();
+      else if (role === 'suika') SE.suika();
+      else if (role !== 'replay') SE.cherry();
+      winTimer = setTimeout(clearWin, 1700);
+    }
+    function showNav(order: number[] | null) {
+      document.querySelectorAll<HTMLElement>('.dk-stop').forEach((b, r) => {
+        const navEl = b.querySelector('.dk-nav') as HTMLElement;
+        const k = order ? order.indexOf(r) : -1;
+        navEl.textContent = k >= 0 && !pressed.includes(r) ? String(k + 1) : '';
+        b.classList.toggle('navnext', !!order && order[pressed.length] === r);
+      });
+    }
+
+    async function lever() {
+      if (phase !== 'idle' || !token()) return;
+      if (bet === 0) maxBet(true);
+      if (bet === 0) return;
+      phase = 'spinning';
+      tops = [null, null, null];
+      stopping = [];
+      stopsReady = false;
+      pressed = [];
+      game = null;
+      atGame = null;
+      pressFx($('lever'), 'pulled');
+      SE.lever();
+      clearWin();
+      if (soundOn) loadVoices();
+      if (!bonus) msg('');
+      const waitUntil = lastStart + TIMING.waitMs;
+      let delayed = false;
+      if (bonus) {
+        atGame = bonus.games[bonus.idx];
+        target = atGame.role;
+      } else {
+        let r;
+        try { r = await api('/api/doki/spin', 'POST'); } catch { r = { status: 0, ok: false, body: {} }; }
+        if (!r.ok) {
+          SE.buzz();
+          msg(r.status === 401 ? 'ログインが切れました。もう一度ログインしてください' : REASON[r.body.reason] ?? '回せませんでした。少し待ってからもう一度');
+          credit += bet; bet = 0; renderLeds();
+          phase = 'idle';
+          return;
+        }
+        game = r.body as Spin;
+        available = r.body.available;
+        target = game.canAlign && game.pending ? game.pending : game.role;
+        delayed = game.premium === 'delay';
+        if (game.premium === 'senchika') { setHibi(ALL); await sleep(120); setHibi(NONE); }
+        if (game.lamp === 'pre' && game.premium !== 'senchika') void playPattern(game.pattern ?? 'normal');
+      }
+      const wait = waitUntil - performance.now();
+      if (wait > 0) await sleep(wait);
+      lastStart = performance.now();
+      if (game?.premium === 'freeze') {
+        // フリーズ：リールが回らずに筐体が震え、そのあとゆっくり回り始める
+        $('cab').classList.add('freeze');
+        SE.freeze();
+        await sleep(2600);
+        $('cab').classList.remove('freeze');
+      }
+      spinAll(delayed);
+      if (game?.premium !== 'silent') SE.start();
+      await sleep(TIMING.accelMs + (delayed ? 900 : 0));
+      if (game?.premium === 'senchika') void playPattern(game.pattern ?? 'normal');
+      stopsReady = true;
+      document.querySelectorAll<HTMLButtonElement>('.dk-stop').forEach((b) => { b.disabled = false; });
+      if (atGame?.role === 'bell' && atGame.nav != null) { showNav(ORDERS[atGame.nav]); callNav(ORDERS[atGame.nav][0]); }
+      if (autoStop()) {
+        const order = atGame?.role === 'bell' && atGame.nav != null ? ORDERS[atGame.nav] : [0, 1, 2];
+        for (const r of order) { await sleep(r === order[0] ? 150 : 280); stop(r); }
+      }
+    }
+
+    function stop(r: number) {
+      if (!stopsReady || tops[r] != null || phase !== 'spinning') return;
+      const btn = document.querySelector(`[data-stop="${r}"]`) as HTMLButtonElement;
+      btn.disabled = true;
+      pressFx(btn);
+      // ナビを外した押し順ベルは、こぼし（1枚）にする
+      if (atGame?.role === 'bell' && atGame.nav != null && target === 'bell' && ORDERS[atGame.nav][pressed.length] !== r) target = 'bell_miss';
+      pressed.push(r);
+      if (atGame?.role === 'bell' && atGame.nav != null) {
+        showNav(target === 'bell' ? ORDERS[atGame.nav] : null);
+      }
+      const press = autoStop() ? aimPress(r, tops, target) : mod(Math.floor(reels[r].pos));
+      const { top } = chooseStop(r, press, tops, target);
+      tops[r] = top;
+      stopping.push(stopAt(r, top));
+      if (tops.every((t) => t != null)) {
+        stopsReady = false;
+        phase = 'settling';
+        Promise.all(stopping).then(settle);
+      }
+    }
+
+    async function countUp(n: number, msEach = 40) {
+      const base = Number($('pay').textContent) || 0;
+      for (let i = 1; i <= n; i++) { $('pay').textContent = String(base + i); credit += 1; renderLeds(); SE.coin(i); await sleep(msEach); }
+    }
+
+    async function settle() {
+      bet = 0;
+      showNav(null);
+      const f = tops as number[];
+      if (bonus && atGame) {
+        const role: Role = target === 'bell_miss' ? 'bell_miss' : atGame.role;
+        if (role === 'bell_miss' && atGame.role === 'bell') bonus.misses++;
+        winFx(f, role);
+        if (role === 'replay') { SE.replay(); replayNext = true; }
+        else if (PAYOUT[role] > 0) { await countUp(PAYOUT[role], 25); bonus.paid += PAYOUT[role]; }
+        if (atGame.stock && !bonus.stocked) { bonus.stocked = true; kana.classList.add('on'); SE.kana(); msg('しなのちゃんランプ点灯！ 1G連 確定！', true); }
+        bonus.idx++;
+        if (bonus.idx >= bonus.games.length) await endBonus();
+        phase = 'idle';
+        renderLeds();
+        return;
+      }
+      const g = game!;
+      if (g.lamp === 'post') {
+        if (g.premium === 'flash') { $('cab').classList.add('flash'); for (let i = 0; i < 6; i++) { SE.flash(); await sleep(120); } $('cab').classList.remove('flash'); }
+        await sleep(80);
+        void playPattern(g.pattern ?? 'normal');
+      }
+      pending = g.pending;
+      since = g.since;
+      const mc = counters[machine - 1];
+      for (const c of [mc.mine, mc.all]) {
+        c.games += 1; c.diff += g.pay - BET;
+        if (g.role === 'cbell') c.cbell += 1;
+        if (c.since != null) c.since += 1;
+        if (c.games % GRAPH_EVERY === 0) c.graph.push(c.diff);
+      }
+      if (target !== 'big' && target !== 'reg') winFx(f, g.role);
+      if (target === 'big' || target === 'reg') {
+        if (shows(f, target)) { await startBonus(target); phase = 'idle'; renderLeds(); return; }
+        msg('7 を狙いましょう（各リールに 7 は1つずつ）', true);
+      } else if (target === 'replay') { SE.replay(); replayNext = true; msg('リプレイ'); }
+      else if (g.pay > 0) await countUp(g.pay);
+      if (g.lamp) msg(g.premium ? 'プレミア！ ボーナス確定！ 次のゲームで 7 を狙いましょう' : 'ハイビスカスが光りました！ 次のゲームで 7 を狙いましょう', true);
+      else if (g.role === 'mcherry') msg('中段チェリー！', true);
+      if (!bonus) syncCredit();
+      render();
+      phase = 'idle';
+    }
+
+    async function startBonus(kind: 'big' | 'reg') {
+      let r;
+      try { r = await api('/api/doki/align', 'POST'); } catch { r = { ok: false, status: 0, body: {} }; }
+      if (!r.ok) { msg('ボーナスの記録に失敗しました。ページを読み込み直してください'); return; }
+      clearLamp();
+      pending = null;
+      available = r.body.available;
+      const d = r.body;
+      chain = d.chain;
+      bonuses = [{ kind, game: d.today.games, since: d.since, chain: d.chain, machine }, ...bonuses];
+      const mc = counters[machine - 1];
+      for (const c of [mc.mine, mc.all]) { c[kind] += 1; }
+      mc.all.since = 0;
+      mc.allBonuses = [{ kind, msince: d.msince ?? 0, chain: d.chain, created_at: new Date().toISOString() }, ...mc.allBonuses];
+      since = 0;
+      bonus = { kind, games: d.games, idx: 0, paid: 0, misses: 0, next: d.next, stocked: false };
+      kana.classList.remove('on');
+      msg((kind === 'big' ? '★ BIG BONUS ★' : '☆ REG BONUS ☆') + (chain > 1 ? `　🌺 ${chain}連！` : '') + '　ナビの順に押してください', true);
+      $('pay').textContent = '0';
+      renderLeds();
+      await sleep(fanfare(kind));
+      if (soundOn) startBgm(kind);
+    }
+
+    async function endBonus() {
+      const b = bonus!;
+      stopBgm();
+      endJingle();
+      if (b.misses > 0) {
+        try { const r = await api('/api/doki/miss', 'POST', { n: b.misses }); if (r.ok) available = r.body.available; } catch { /* 戻せなくても続ける */ }
+      }
+      bonus = null;
+      kana.classList.remove('on');
+      const mc = counters[machine - 1];
+      const net = b.paid - BET * b.games.length;
+      for (const c of [mc.mine, mc.all]) c.diff += net;
+      syncCredit();
+      if (b.next) {
+        // 1G連：すぐ次のボーナス
+        pending = b.next;
+        void playPattern('doki');
+        msg(`${b.kind === 'big' ? 'BIG' : 'REG'} 終了（${b.paid}枚）。1G連！ 7 を狙いましょう`, true);
+      } else {
+        msg(`${b.kind === 'big' ? 'BIG' : 'REG'} 終了！ ${b.paid}枚の払い出し。32G までに当たれば連チャン`, true);
+      }
+      render();
+    }
+
+    $('lever').addEventListener('click', lever);
+    $('maxbet').addEventListener('click', () => maxBet());
+    document.querySelectorAll<HTMLElement>('.dk-stop').forEach((b) => b.addEventListener('click', () => stop(Number(b.dataset.stop))));
+    document.addEventListener('keydown', (e) => {
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement || e.repeat) return;
+      if (e.code === 'Space' || e.code === 'Enter') {
+        e.preventDefault();
+        if (phase === 'spinning' && stopsReady) {
+          // ナビがあるときはナビの順、なければ左から
+          const order = atGame?.role === 'bell' && atGame.nav != null && target === 'bell' ? ORDERS[atGame.nav] : [0, 1, 2];
+          const next = order.find((r) => tops[r] == null);
+          if (next != null) stop(next);
+        } else lever();
+      } else if (e.code === 'KeyB') maxBet();
+      else if (['Digit1', 'Digit2', 'Digit3', 'Numpad1', 'Numpad2', 'Numpad3'].includes(e.code)) stop(Number(e.code.slice(-1)) - 1);
+      else if (['KeyQ', 'KeyW', 'KeyE'].includes(e.code)) stop(['KeyQ', 'KeyW', 'KeyE'].indexOf(e.code));
+    });
+    void AT_GAMES;
+    loadState();
+  </script>
+</Layout>
